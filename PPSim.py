@@ -40,7 +40,9 @@ for q, p in TR_LINES:
     tr_lines[(q, p)] = pp.create_transformer(net, bus[q], bus[p], "63 MVA 110/20 kV", f"transform{q}-{p}")
 
 # Since bus one has the slack, we create the ext_grid at bus 1, then the rest at their respective index.
-pp.create_ext_grid(net, bus[1], vm_pu=1.02, name="Slack")
+pp.create_ext_grid(net, bus[1], vm_pu=1.06, name="Slack")
+pp.create_shunt(net, bus[9], q_mvar=-19.0)
+
 for b, p, v, q_min, q_max in GENS_IDX:
     pp.create_gen(net, bus[b], p, v, min_q_mvar=q_min, max_q_mvar=q_max, name=f"Gen{b}")
 
