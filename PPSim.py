@@ -144,6 +144,8 @@ def generate_dataset(n_samples=2000, steps_per_day=96, rho=0.9, noise_std=0.04,
     return df
 
 
+
+
 if __name__ == "__main__":
     df = generate_dataset(n_samples=2000, seed=0, output_csv="grid_dataset.csv")
 
