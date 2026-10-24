@@ -18,6 +18,8 @@ class GATAutoencoder(nn.Module):
         self.dec_lstm = nn.LSTM(latent, latent, batch_first=True)
         self.out = nn.Linear(latent, n_features)
 
+        self.register_buffer("threshold", torch.tensor(float("inf")))
+
     def encode(self, x, edge_index):
         B, T, N, F = x.shape
 
@@ -57,6 +59,20 @@ class GATAutoencoder(nn.Module):
 
         return window_score, bus_score
 
+    def fit_threshold(self, x_val, edge_index, q=0.99):
+        window_score, _ = self.score(x_val, edge_index)
+        threshold = torch.quantile(window_score, q)
+        self.threshold = threshold
+
+        return threshold
+
+    def detect(self, x, edge_index):
+        window_score, _ = self.score(x, edge_index)
+        flags = window_score > self.threshold
+
+        return flags, window_score
+
+
 if __name__ == "__main__":
     B, T, N, F = 2, 5, 6, 3
     ei = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 0]])
@@ -76,6 +92,11 @@ if __name__ == "__main__":
     print(w.shape, b.shape)
     assert w.shape == (B,)
     assert b.shape == (B, N)
+
+    thr = model.fit_threshold(x, ei)
+    flags, scores = model.detect(x, ei)
+    print(thr, flags)
+    assert flags.shape == (B,)
 
     model.eval()
     r_batch, z_batch = model(x, ei)
