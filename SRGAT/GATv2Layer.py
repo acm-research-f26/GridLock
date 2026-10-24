@@ -33,5 +33,53 @@ class GATv2Layer(nn.Module):
 
         relu = f.leaky_relu(x_src + x_tgt, self.negative_slope)
         scores = (self.att * relu).sum(dim=-1)
+        idx = tgt_i.unsqueeze(-1).expand_as(scores)
 
+        neg_inf = float("-inf")
+        group_max = scores.new_full((x.size(0), self.heads), neg_inf)
+        group_max = group_max.scatter_reduce(0, idx, scores, reduce="amax", include_self=False)
+
+        scores = scores - group_max[tgt_i]
+        exp = scores.exp()
+
+        den = scores.new_zeros(x.size(0), self.heads).scatter_add(0, idx, exp)
+        alpha = exp / (den[tgt_i] + 1e-16)
+
+        alpha = self.dropout(alpha)
+        messages = alpha.unsqueeze(-1) * x_src
+
+        m_idx = tgt_i.view(-1, 1, 1).expand_as(messages)
+
+        out = messages.new_zeros(x.size(0), self.heads, self.out_features).scatter_add(0, m_idx, messages)
+        if self.concat:
+            out = out.reshape(out.size(0), self.heads * self.out_features)
+        else:
+            out = out.mean(dim=1)
+
+        return out + self.bias
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    layer = GATv2Layer(in_features=4, out_features=16, heads=4)
+    x = torch.randn(14, 4)
+    edges = torch.randint(0, 14, (2, 40))
+    loops = torch.arange(14).repeat(2, 1)
+    edge_index = torch.cat([edges, loops], dim=1)
+
+    out = layer(x, edge_index)
+    print(out.shape)
+    assert out.shape == (14, 64)
+    assert not torch.isnan(out).any()
+
+    out.sum().backward()
+    assert layer.att.grad is not None
+    assert layer.lin_src.weight.grad is not None
+    assert layer.lin_tgt.weight.grad is not None
+
+    layer2 = GATv2Layer(4, 16, heads=4, concat=False)
+    out2 = layer2(x, edge_index)
+    print(out2.shape)
+    assert out2.shape == (14, 16)
+
+    print("all checks passed")
 
