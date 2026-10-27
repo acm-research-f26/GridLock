@@ -76,7 +76,7 @@ class GATAutoencoder(nn.Module):
 if __name__ == "__main__":
     B, T, N, F = 2, 5, 6, 3
     ei = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 0]])
-    ei = torch.cat([ei, torch.arange(N).repeat(2, 1)], dim=1)  # self loops
+    ei = torch.cat([ei, torch.arange(N).repeat(2, 1)], dim=1)
 
     model = GATAutoencoder(F)
     x = torch.randn(B, T, N, F)

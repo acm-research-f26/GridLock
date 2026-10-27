@@ -15,12 +15,12 @@ class LSTMBaseline(nn.Module):
         self.decoder = nn.LSTM(hidden, hidden, layers, batch_first=True)
         self.linear = nn.Linear(hidden, n_features)
 
-    def forward(self, x):                                   # (B, T, F)
+    def forward(self, x):
         seq_len = x.size(1)
         _, (h_n, _) = self.encoder(x)
         dec_in = h_n[-1].unsqueeze(1).repeat(1, seq_len, 1)  # (B, T, H)
         dec_out, _ = self.decoder(dec_in)
-        return self.linear(dec_out)                          # (B, T, F)
+        return self.linear(dec_out)
 
     def fit(self, data, val=None, epochs=50, batch_size=32, lr=1e-3, verbose=True):
         loader = DataLoader(TensorDataset(data), batch_size=batch_size, shuffle=True)
