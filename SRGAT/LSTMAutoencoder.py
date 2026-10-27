@@ -1,84 +1,54 @@
+try:
+    from .Training import ReconstructionTraining
+except ImportError:
+    from Training import ReconstructionTraining
 import torch
 import torch.nn as nn
-import numpy as np
-import pandas as pd
-from torch.utils.data import DataLoader, TensorDataset
 
 
-class LSTMBaseline(nn.Module):
-    """Two-layer LSTM autoencoder. Train on normal data only;
-    high reconstruction error at inference means anomaly."""
+class LSTMBaseline(ReconstructionTraining, nn.Module):
+    """Two-layer LSTM autoencoder over flattened bus features (no graph).
+    Train on normal data only; high reconstruction error means anomaly."""
 
-    def __init__(self, n_features, hidden=64, layers=2):
+    def __init__(self, node_count, n_features, hidden=64, layers=2):
         super().__init__()
-        self.encoder = nn.LSTM(n_features, hidden, layers, batch_first=True)
+        d = node_count * n_features
+        self.encoder = nn.LSTM(d, hidden, layers, batch_first=True)
         self.decoder = nn.LSTM(hidden, hidden, layers, batch_first=True)
-        self.linear = nn.Linear(hidden, n_features)
+        self.linear = nn.Linear(hidden, d)
 
-    def forward(self, x):
-        seq_len = x.size(1)
-        _, (h_n, _) = self.encoder(x)
-        dec_in = h_n[-1].unsqueeze(1).repeat(1, seq_len, 1)  # (B, T, H)
+        self.register_buffer("threshold", torch.tensor(float("inf")))
+
+    def forward(self, x, edge_index=None):
+        # edge_index is accepted for interface parity and ignored.
+        B, T, N, F = x.shape
+        _, (h_n, _) = self.encoder(x.reshape(B, T, N * F))
+        dec_in = h_n[-1].unsqueeze(1).repeat(1, T, 1)  # (B, T, H)
         dec_out, _ = self.decoder(dec_in)
-        return self.linear(dec_out)
+        return self.linear(dec_out).view(B, T, N, F), h_n[-1]
 
-    def fit(self, data, val=None, epochs=50, batch_size=32, lr=1e-3, verbose=True):
-        loader = DataLoader(TensorDataset(data), batch_size=batch_size, shuffle=True)
-        opt = torch.optim.Adam(self.parameters(), lr=lr)
-        loss_fn = nn.MSELoss()
-
-        for epoch in range(epochs):
-            self.train()
-            total = 0.0
-            for (batch,) in loader:
-                opt.zero_grad()
-                loss = loss_fn(self(batch), batch)
-                loss.backward()
-                opt.step()
-                total += loss.item() * batch.size(0)
-            train_loss = total / len(data)
-
-            msg = f"epoch {epoch + 1:3d}  train {train_loss:.6f}"
-            if val is not None:
-                self.eval()
-                with torch.no_grad():
-                    msg += f"  val {loss_fn(self(val), val).item():.6f}"
-            if verbose:
-                print(msg)
-
-    @torch.no_grad()
-    def score(self, data):
-        """Per-window reconstruction error. Returns (n_windows,)."""
-        self.eval()
-        return ((self(data) - data) ** 2).mean(dim=(1, 2))
-
-def load_grid_data(csv, window=24, train_frac=0.7):
-    df = pd.read_csv(csv).drop(columns=["timestep"])
-    df = df[df.columns[df.std() > 1e-9]]  # safety net
-    arr = df.to_numpy(dtype=np.float32)
-
-    split = int(len(arr) * train_frac)
-    mu = arr[:split].mean(axis=0)
-    sigma = arr[:split].std(axis=0)
-    sigma[sigma < 1e-9] = 1.0
-    scaled = (arr - mu) / sigma
-
-    def windows(a):
-        return torch.from_numpy(
-            np.stack([a[i:i + window] for i in range(len(a) - window + 1)]))
-
-    return windows(scaled[:split]), windows(scaled[split:]), (mu, sigma)
 
 if __name__ == "__main__":
-    train_windows, val_windows, scaler = load_grid_data("grid_dataset.csv")
+    B, T, N, F = 2, 5, 6, 3
+    ei = torch.arange(N).repeat(2, 1)
 
-    model = LSTMBaseline(n_features=train_windows.shape[2])
-    model.fit(train_windows)
+    model = LSTMBaseline(N, F, hidden=16)
+    x = torch.randn(B, T, N, F)
+    recon, z = model(x, ei)
 
-    errors = model.score(val_windows)
-    threshold = errors.mean() + 3 * errors.std()
-    print(f"threshold: {threshold:.4f}  (val error mean {errors.mean():.4f})")
+    assert recon.shape == x.shape
+    assert z.shape == (B, 16)
 
-    torch.save({"state_dict": model.state_dict(),
-                "threshold": threshold,
-                "mu": scaler[0], "sigma": scaler[1]}, "../baseline.pt")
+    nn.functional.mse_loss(recon, x).backward()
+    assert all(p.grad is not None for p in model.parameters())
+
+    w, b = model.score(x, ei)
+    assert w.shape == (B,)
+    assert b.shape == (B, N)
+
+    thr = model.fit_threshold(x, ei)
+    flags, scores = model.detect(x, ei)
+    print(thr, flags)
+    assert flags.shape == (B,)
+
+    print("ok")

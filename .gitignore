@@ -1,5 +1,5 @@
 __pycache__/
 *.pyc
-grid_dataset.csv
-baseline.pt
+Dataset/
+logs/
 targeted_constrained_fdi.png

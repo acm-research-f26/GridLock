@@ -1,4 +1,9 @@
-from GATv2Layer import GATv2Layer
+try:
+    from .GATv2Layer import GATv2Layer
+    from .Training import ReconstructionTraining
+except ImportError:
+    from GATv2Layer import GATv2Layer
+    from Training import ReconstructionTraining
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
@@ -9,7 +14,7 @@ def batch_edge_index(edge_index, num_graphs, num_nodes):
 
     return shifted.permute(1, 0, 2).reshape(2, -1)
 
-class GATAutoencoder(nn.Module):
+class GATAutoencoder(ReconstructionTraining, nn.Module):
     def __init__(self, n_features, hidden=16, heads=4 ,latent=32, dropout=0.0):
         super().__init__()
         self.gat1 = GATv2Layer(n_features, hidden, heads, concat=True, dropout=dropout)
@@ -45,32 +50,6 @@ class GATAutoencoder(nn.Module):
     def forward(self, x, edge_index):
         z = self.encode(x, edge_index)
         return self.decode(z, x.size(1)), z
-
-    def score(self, x, edge_index):
-        self.eval()
-        with torch.no_grad():
-            recon, _ = self(x, edge_index)
-
-        err = (recon - x) ** 2
-        bus_score = err.mean(dim=(1, 3))
-        window_score = bus_score.mean(1)
-
-        self.train()
-
-        return window_score, bus_score
-
-    def fit_threshold(self, x_val, edge_index, q=0.99):
-        window_score, _ = self.score(x_val, edge_index)
-        threshold = torch.quantile(window_score, q)
-        self.threshold = threshold
-
-        return threshold
-
-    def detect(self, x, edge_index):
-        window_score, _ = self.score(x, edge_index)
-        flags = window_score > self.threshold
-
-        return flags, window_score
 
 
 if __name__ == "__main__":

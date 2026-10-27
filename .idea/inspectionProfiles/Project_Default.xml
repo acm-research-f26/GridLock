@@ -1,0 +1,22 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="numpy" />
+          <option value="pybullet" />
+          <option value="gymnasium" />
+          <option value="stable-baselines3" />
+          <option value="torch" />
+          <option value="dm-control" />
+          <option value="imitation" />
+          <option value="pettingzoo" />
+          <option value="cleanrl" />
+          <option value="supersuit" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyTypeCheckerInspection" enabled="false" level="WARNING" enabled_by_default="false" />
+  </profile>
+</component>
