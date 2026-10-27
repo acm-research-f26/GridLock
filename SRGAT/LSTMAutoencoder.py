@@ -81,4 +81,4 @@ if __name__ == "__main__":
 
     torch.save({"state_dict": model.state_dict(),
                 "threshold": threshold,
-                "mu": scaler[0], "sigma": scaler[1]}, "baseline.pt")
+                "mu": scaler[0], "sigma": scaler[1]}, "../baseline.pt")

@@ -17,7 +17,7 @@ from scipy.stats import chi2
 import pandapower as pp
 
 from PPSim import create_ieee14_network, daily_profile, ar1_noise
-from LSTMAutoencoder import LSTMBaseline
+from SRGAT.LSTMAutoencoder import LSTMBaseline
 import torch
 
 
