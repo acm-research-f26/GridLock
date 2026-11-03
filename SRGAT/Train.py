@@ -67,6 +67,11 @@ def train_gat(
     print(f"  Validation: {tuple(val_x.shape)}")
     print(f"  Test:       {tuple(test_x.shape)}")
     print(f"  Graph:      {metadata['graph']['node_count']} nodes, {edges.shape[1]} directed edges (incl. self-loops)")
+    noise = metadata.get("measurement_noise") or {}
+    overrides = ", ".join(f"{name} {rel:.1%}" for name, rel in (noise.get("feature_rel") or {}).items())
+    print(f"  Noise:      {noise.get('rel', 0.0):.0%} on {noise.get('columns', 0)} metered P/Q columns "
+          f"(same draws as PhysicsDetector) + {noise.get('feature_columns', 0)} other node-feature columns"
+          + (f" ({overrides})" if overrides else ""))
     print(f"Using device: {device}")
 
     if any(len(x) == 0 for x in splits.values()):
@@ -147,6 +152,7 @@ def train_gat(
         torch.save(checkpoint, save_path)
         report = dict(model_type=model_type, parameter_count=sum(p.numel() for p in model.parameters()), seed=seed, device=device, epochs=epochs, threshold=float(threshold),
                       csv=str(Path(csv).resolve()), window=window, train_seconds=train_seconds,
+                      measurement_noise=metadata.get("measurement_noise"),
                       best_val_loss=min(history["val_loss"]),
                       split_windows={name: len(value) for name, value in splits.items()},
                       test_flagged=flagged_count, test_windows=len(test_x),

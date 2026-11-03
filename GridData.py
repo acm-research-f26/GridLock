@@ -16,11 +16,85 @@ NODE_FEATURES = ('vm_pu', 'va_degree', 'p_injection_mw', 'q_injection_mvar', 'lo
 
 NORMALIZATION_VERSION = 'shared_bus_type_v2'
 
+# Measurement noise shared by the GAT training data and PhysicsDetector, so both
+# detectors see the same noisy telemetry: sigma = max(rel * |x|, floor) per value.
+MEASUREMENT_NOISE = 0.02
+NOISE_FLOOR = 0.1
+NOISE_SEED = 0
+# The remaining GAT node features (not read by PhysicsDetector) get the same relative
+# level with a floor in each feature's own unit, from an independent random stream so
+# the P/Q draws above stay identical to PhysicsDetector's.
+FEATURE_NOISE_FLOORS = {'vm_pu': 0.001, 'va_degree': 0.01, 'load_p_mw': NOISE_FLOOR,
+                        'load_q_mvar': NOISE_FLOOR, 'incident_current_max_ka': 0.001,
+                        'allocated_loss_mw': 0.01}
+# Per-feature overrides of the relative level. 2% of ~1.04 pu is ~6x the natural
+# voltage variation (std ~0.0034 pu); 0.1% (~0.001 pu) is a realistic meter and keeps
+# noise/variation near the other features' ~0.2.
+FEATURE_NOISE_REL = {'vm_pu': 0.001}
+NOISE_SCOPE = 'pq_and_node_features_v2'
+
 
 def node_columns(node_count, fields=NODE_FEATURES):
     """Bus-major ordering; demand uses the team's Load{n}_... CSV names."""
     return [f'Load{bus}_{field[5:]}' if field.startswith('load_') else f'Bus{bus}_{field}'
             for bus in range(1, node_count + 1) for field in fields]
+
+
+def noise_columns(graph):
+    """Metered P/Q: branch flows at both terminals, then bus P and Q injections.
+
+    Order matters: it fixes which random draw each column gets.
+    """
+    flows = {b[key][i] for b in graph['branches']
+             for key in ('feature_columns', 'reverse_feature_columns') for i in (1, 2)}
+    buses = range(1, graph['node_count'] + 1)
+    return (sorted(flows) + [f'Bus{i}_p_injection_mw' for i in buses]
+            + [f'Bus{i}_q_injection_mvar' for i in buses])
+
+
+def add_measurement_noise(frame, cols, rel=MEASUREMENT_NOISE, floor=NOISE_FLOOR, seed=NOISE_SEED):
+    """Gaussian noise with sigma = max(rel * |x|, floor). Apply to the full raw table
+    (before filtering rows) so every consumer gets identical draws per row."""
+    rng = np.random.default_rng(seed)
+    vals = frame[cols].to_numpy()
+    sigma = np.maximum(rel * np.abs(vals), floor)
+    noise = rng.normal(0, 1, vals.shape)
+
+    noisy = frame.copy()
+    noisy[cols] = vals + noise * sigma
+    return noisy
+
+
+def feature_noise_columns(frame, node_count):
+    """Columns of the other GAT node features that carry a meter. Always-zero columns
+    (buses without load, the slack reference angle) are not measured and stay exact."""
+    return {field: [c for c in node_columns(node_count, (field,)) if not frame[c].fillna(0).eq(0).all()]
+            for field in FEATURE_NOISE_FLOORS}
+
+
+def add_feature_noise(frame, node_count, rel=MEASUREMENT_NOISE, seed=NOISE_SEED):
+    """Noise the non-P/Q GAT node features: sigma = max(rel_f * |x|, per-unit floor),
+    where rel_f is FEATURE_NOISE_REL[field] if set, else rel."""
+    columns = feature_noise_columns(frame, node_count)
+    cols = [c for field in FEATURE_NOISE_FLOORS for c in columns[field]]
+    floors = np.asarray([FEATURE_NOISE_FLOORS[field] for field in FEATURE_NOISE_FLOORS
+                         for _ in columns[field]])
+    rels = np.asarray([FEATURE_NOISE_REL.get(field, rel) for field in FEATURE_NOISE_FLOORS
+                       for _ in columns[field]])
+    rng = np.random.default_rng([seed, 1])  # independent of the P/Q stream
+    vals = frame[cols].to_numpy()
+    sigma = np.maximum(rels * np.abs(vals), floors)
+
+    noisy = frame.copy()
+    noisy[cols] = vals + rng.normal(0, 1, vals.shape) * sigma
+    return noisy, len(cols)
+
+
+def noisy_measurements(frame, graph, noise=MEASUREMENT_NOISE, noise_seed=NOISE_SEED):
+    """Full telemetry noise model on a raw table: P/Q (PhysicsDetector's draws) plus
+    the other node features. Returns the noisy table and the extra-feature column count."""
+    frame = add_measurement_noise(frame, noise_columns(graph), noise, NOISE_FLOOR, noise_seed)
+    return add_feature_noise(frame, graph['node_count'], noise, noise_seed)
 
 
 def shared_scaler(training, features, graph):
@@ -75,12 +149,14 @@ def _check_time(frame):
     return steps.astype(np.int64)
 
 
-def prepare_rows(csv, train_frac=0.7, val_frac=0.15):
+def prepare_rows(csv, train_frac=0.7, val_frac=0.15, noise=MEASUREMENT_NOISE, noise_seed=NOISE_SEED):
     """Return normalized physical rows and frozen preprocessing metadata.
 
     Split ORIGINAL chronological row positions before filtering. Invalid rows are
     omitted without imputation; their timestep gaps survive into window construction.
     Operational-limit violations are excluded from the normal training baseline.
+    Raw CSVs get measurement noise (noise_columns) before normalization; prepared
+    CSVs must already have been exported with the same noise level.
     """
     if not 0 < train_frac < 1 or not 0 < val_frac or train_frac + val_frac >= 1:
         raise ValueError('Require positive train, validation and test fractions')
@@ -96,6 +172,11 @@ def prepare_rows(csv, train_frac=0.7, val_frac=0.15):
             raise ValueError('Prepared dataset has frozen split fractions; regenerate it to change them')
         if metadata.get('normalization_version') != NORMALIZATION_VERSION:
             raise ValueError('Outdated normalization; regenerate ML data from raw measurements')
+        recorded = metadata.get('measurement_noise') or {}
+        if not np.isclose(recorded.get('rel', 0.0), noise) or (noise and recorded.get('scope') != NOISE_SCOPE):
+            raise ValueError(f'Prepared dataset has {recorded.get("rel", 0.0):.0%} measurement noise '
+                             f'(scope {recorded.get("scope")}), expected {noise:.0%} ({NOISE_SCOPE}); '
+                             f'regenerate it with GridData.py --noise {noise}')
         features = metadata['feature_columns']
         values = frame[features].to_numpy(dtype=np.float64)
         if not np.isfinite(values).all():
@@ -113,6 +194,11 @@ def prepare_rows(csv, train_frac=0.7, val_frac=0.15):
     graph = report.get('graph')
     if graph and (graph.get('schema_version') != 2 or graph.get('node_features') != list(NODE_FEATURES)):
         raise ValueError('Outdated raw graph schema; regenerate data with PPSim39.py')
+    feature_noise_count = 0
+    if noise:
+        if not graph:
+            raise ValueError('Measurement noise needs the graph report to choose metered columns')
+        frame, feature_noise_count = noisy_measurements(frame, graph, noise, noise_seed)
     features = report.get('feature_columns', physical_columns(frame))
     if not features or len(features) != len(set(features)):
         raise ValueError('No physical features or duplicate feature names')
@@ -151,16 +237,23 @@ def prepare_rows(csv, train_frac=0.7, val_frac=0.15):
                     excluded_timesteps=steps[~accepted].tolist(),
                     split_row_counts={name: int((selected['split'] == name).sum()) for name in SPLITS},
                     graph=report.get('graph'),
+                    measurement_noise=dict(rel=noise, floor=NOISE_FLOOR, seed=noise_seed,
+                                           scope=NOISE_SCOPE if noise else None,
+                                           columns=len(noise_columns(graph)) if noise else 0,
+                                           feature_columns=feature_noise_count,
+                                           feature_floors=FEATURE_NOISE_FLOORS if noise else None,
+                                           feature_rel=FEATURE_NOISE_REL if noise else None),
                     operational_policy='Keep numerically valid states within modeled limits for normal-only training; no attack labels inferred.',
                     window_policy='No windows across split boundaries or missing/nonconsecutive timesteps; no interpolation.',
                     normalization='Node feature types pooled over all buses and valid TRAIN timesteps; edge feature types pooled over physical directed branches and TRAIN. Other columns scaled individually. Zero std uses scale 1; all columns retained.')
     return selected, normalized, metadata
 
 
-def export_ml_dataset(raw_csv, output_csv=ML_OUTPUT, train_frac=0.7, val_frac=0.15):
+def export_ml_dataset(raw_csv, output_csv=ML_OUTPUT, train_frac=0.7, val_frac=0.15,
+                      noise=MEASUREMENT_NOISE, noise_seed=NOISE_SEED):
     if Path(raw_csv).resolve() == Path(output_csv).resolve():
         raise ValueError('Raw and ML output paths must differ')
-    frame, normalized, metadata = prepare_rows(raw_csv, train_frac, val_frac)
+    frame, normalized, metadata = prepare_rows(raw_csv, train_frac, val_frac, noise, noise_seed)
     columns = ['timestep', 'simulation_time_minutes', 'split']
     if 'within_modeled_limits' in frame:
         columns.append('within_modeled_limits')
@@ -170,7 +263,7 @@ def export_ml_dataset(raw_csv, output_csv=ML_OUTPUT, train_frac=0.7, val_frac=0.
     out.to_csv(output_csv, index=False)
     Path(str(output_csv) + '.manifest.json').write_text(json.dumps(metadata, indent=2) + '\n')
     print(f'Saved {output_csv}: {out.shape}; excluded {metadata["excluded_rows"]} failed/invalid rows; '
-          f'{len(metadata["active_lstm_features"])} LSTM features', flush=True)
+          f'{len(metadata["active_lstm_features"])} LSTM features; {noise:.0%} measurement noise', flush=True)
     return out, metadata
 
 
@@ -210,5 +303,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--raw', default=RAW_OUTPUT)
     parser.add_argument('--output', default=ML_OUTPUT)
+    parser.add_argument('--noise', type=float, default=MEASUREMENT_NOISE,
+                        help='Relative measurement noise on metered P/Q (must match PhysicsDetector)')
+    parser.add_argument('--noise-seed', type=int, default=NOISE_SEED)
     args = parser.parse_args()
-    export_ml_dataset(args.raw, args.output)
+    export_ml_dataset(args.raw, args.output, noise=args.noise, noise_seed=args.noise_seed)
