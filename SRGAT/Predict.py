@@ -16,6 +16,21 @@ LOG_DIR = ROOT / 'logs'
 from GridData import _check_time, _true_flags, sequence_windows, node_columns, NORMALIZATION_VERSION
 from SRGAT.GATAutoencoder import GATAutoencoder
 from SRGAT.LSTMAutoencoder import LSTMBaseline
+from SRGAT.NAGATModel import NAGATAutoencoder
+
+
+def build_model(saved):
+    """Rebuild a trained model (with its threshold buffer) from a Train.py checkpoint."""
+    hp = saved['hyperparameters']
+    model_type = saved.get('model_type', 'gat')
+    if model_type == 'lstm':
+        model = LSTMBaseline(hp['node_count'], hp['n_features'], hp['lstm_hidden'], hp['lstm_layers'])
+    elif model_type == 'nagat':
+        model = NAGATAutoencoder(hp['n_features'], hp['hidden'], hp['heads'], hp['latent'], hp['dropout'])
+    else:
+        model = GATAutoencoder(hp['n_features'], hp['hidden'], hp['heads'], hp['latent'], hp['dropout'])
+    model.load_state_dict(saved['model_state_dict'])
+    return model
 
 
 def predict(csv, checkpoint=LOG_DIR / 'srgat_ieee39.pt', output=LOG_DIR / 'ieee39_predictions.csv', batch_size=8):
@@ -45,11 +60,7 @@ def predict(csv, checkpoint=LOG_DIR / 'srgat_ieee39.pt', output=LOG_DIR / 'ieee3
     windows, ends = sequence_windows(values, steps[valid], ['test'] * int(valid.sum()), hp['window'])
     if not len(windows['test']):
         raise ValueError('No complete consecutive windows available for prediction')
-    if saved.get('model_type', 'gat') == 'lstm':
-        model = LSTMBaseline(hp['node_count'], hp['n_features'], hp['lstm_hidden'], hp['lstm_layers'])
-    else:
-        model = GATAutoencoder(hp['n_features'], hp['hidden'], hp['heads'], hp['latent'], hp['dropout'])
-    model.load_state_dict(saved['model_state_dict'])
+    model = build_model(saved)
     score, bus_score = model.score(torch.from_numpy(windows['test']), saved['edge_index'], batch_size)
     result = pd.DataFrame({'end_timestep': ends['test'], 'score': score.numpy(),
                            'flag': (score > model.threshold.cpu()).numpy()})

@@ -1,8 +1,9 @@
-"""Train and compare GAT or flat LSTM autoencoders on identical IEEE39 node windows."""
+"""Train and compare SRGAT, NAGAT or flat LSTM autoencoders on identical IEEE39 node windows."""
 import argparse
 import json
 import numpy as np
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -12,10 +13,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 LOG_DIR = ROOT / "logs"
 
-from GridData import ML_OUTPUT
+from GridData import ML_OUTPUT, NODE_FEATURES
 from SRGAT.Data import load_graph_data
+from SRGAT.Evaluate import inject_attack, detection_metrics
 from SRGAT.GATAutoencoder import GATAutoencoder
 from SRGAT.LSTMAutoencoder import LSTMBaseline
+from SRGAT.NAGATModel import NAGATAutoencoder
+
+DEFAULT_SAVE = {"gat": "srgat_ieee39.pt", "nagat": "nagat_ieee39.pt", "lstm": "lstm_ieee39.pt"}
 
 
 def train_gat(
@@ -36,9 +41,12 @@ def train_gat(
     model_type="gat",
     lstm_hidden=64,
     lstm_layers=2,
+    attack_buses=3,
+    attack_magnitude=1.0,
+    attack_features=("p_injection_mw", "q_injection_mvar"),
 ):
-    if model_type not in {"gat", "lstm"}:
-        raise ValueError("model_type must be gat or lstm")
+    if model_type not in DEFAULT_SAVE:
+        raise ValueError(f"model_type must be one of {', '.join(DEFAULT_SAVE)}")
     if not 0 < quantile < 1:
         raise ValueError("quantile must be between 0 and 1")
     torch.manual_seed(seed)
@@ -67,11 +75,15 @@ def train_gat(
     if model_type == "lstm":
         model = LSTMBaseline(metadata['graph']['node_count'], n_features,
                              hidden=lstm_hidden, layers=lstm_layers).to(device)
+    elif model_type == "nagat":
+        model = NAGATAutoencoder(n_features=n_features, hidden=hidden, heads=heads,
+                                 latent=latent, dropout=dropout).to(device)
     else:
         model = GATAutoencoder(n_features=n_features, hidden=hidden, heads=heads,
                               latent=latent, dropout=dropout).to(device)
 
     print(f"\n--- Training {model_type.upper()} autoencoder ---")
+    start = time.perf_counter()
     history = model.fit(
         train_data=train_x,
         edge_index=edges,
@@ -81,6 +93,8 @@ def train_gat(
         lr=lr,
         verbose=True,
     )
+    train_seconds = time.perf_counter() - start
+    print(f"Training time: {train_seconds:.1f}s")
 
     print("\n--- Calibrating Anomaly Detection Threshold ---")
     threshold = model.fit_threshold(val_x, edges, q=quantile)
@@ -92,6 +106,18 @@ def train_gat(
     print(f"Test windows: {len(test_x)}")
     print(f"Flagged anomalies: {flagged_count} ({flagged_count / len(test_x) * 100:.2f}%)")
     print(f"Test score range: min {float(test_scores.min()):.6f}, max {float(test_scores.max()):.6f}, mean {float(test_scores.mean()):.6f}")
+
+    print("\n--- Synthetic FDI Detection (normal test vs attacked copy) ---")
+    feature_idx = [NODE_FEATURES.index(name) for name in attack_features]
+    attacked_x, _ = inject_attack(test_x, feature_idx, attack_buses, attack_magnitude, seed)
+    attack_flags, attack_scores = model.detect(attacked_x, edges)
+    labels = torch.cat([torch.zeros(len(test_x)), torch.ones(len(attacked_x))])
+    detection = detection_metrics(labels, torch.cat([test_scores, attack_scores]),
+                                  torch.cat([flags, attack_flags]))
+    print(f"Attack: ramp to +/-{attack_magnitude} (normalized) on {', '.join(attack_features)} "
+          f"at {attack_buses} random buses per window")
+    print(f"AUC: {detection['auc']:.4f} | F1: {detection['f1']:.4f} "
+          f"(precision {detection['precision']:.4f}, recall {detection['recall']:.4f})")
 
     if save_path:
         checkpoint = {
@@ -120,11 +146,17 @@ def train_gat(
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         torch.save(checkpoint, save_path)
         report = dict(model_type=model_type, parameter_count=sum(p.numel() for p in model.parameters()), seed=seed, device=device, epochs=epochs, threshold=float(threshold),
+                      csv=str(Path(csv).resolve()), window=window, train_seconds=train_seconds,
+                      best_val_loss=min(history["val_loss"]),
                       split_windows={name: len(value) for name, value in splits.items()},
                       test_flagged=flagged_count, test_windows=len(test_x),
                       normal_test_flag_rate=flagged_count / len(test_x), history=history,
                       score_min=float(test_scores.min()), score_max=float(test_scores.max()),
-                      interpretation="Normal synthetic test data only; flag rate is not attack detection accuracy.")
+                      attack=dict(buses=attack_buses, magnitude=attack_magnitude,
+                                  features=list(attack_features)),
+                      detection=detection,
+                      interpretation="Flag rate is on normal test data. AUC/F1 compare normal test windows "
+                                     "with a synthetic ramp-injection copy, not a stealthy FDI attack.")
         Path(str(save_path) + '.metrics.json').write_text(json.dumps(report, indent=2) + '\n')
         np.savetxt(str(save_path) + '.scores.csv',
                    np.column_stack([end_timesteps['test'], test_scores.numpy(), flags.numpy()]),
@@ -150,9 +182,13 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--threads", type=int, default=2)
-    parser.add_argument("--model", choices=['gat', 'lstm'], default='gat')
+    parser.add_argument("--model", choices=list(DEFAULT_SAVE), default='gat')
     parser.add_argument("--lstm-hidden", type=int, default=64)
     parser.add_argument("--lstm-layers", type=int, default=2)
+    parser.add_argument("--attack-buses", type=int, default=3, help="Buses attacked per window")
+    parser.add_argument("--attack-magnitude", type=float, default=1.0, help="Peak injected offset (normalized units)")
+    parser.add_argument("--attack-features", nargs="+", choices=NODE_FEATURES,
+                        default=["p_injection_mw", "q_injection_mvar"], help="Node features the attack modifies")
     args = parser.parse_args()
 
     train_gat(
@@ -166,10 +202,13 @@ def main():
         latent=args.latent,
         dropout=args.dropout,
         quantile=args.quantile,
-        save_path=args.save or LOG_DIR / ("srgat_ieee39.pt" if args.model == "gat" else "lstm_ieee39.pt"),
+        save_path=args.save or LOG_DIR / DEFAULT_SAVE[args.model],
         model_type=args.model,
         lstm_hidden=args.lstm_hidden,
         lstm_layers=args.lstm_layers,
+        attack_buses=args.attack_buses,
+        attack_magnitude=args.attack_magnitude,
+        attack_features=args.attack_features,
         device=args.device,
         seed=args.seed,
         threads=args.threads,

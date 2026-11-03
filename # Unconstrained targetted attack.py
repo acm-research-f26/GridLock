@@ -3,7 +3,6 @@
 import argparse
 import json
 from pathlib import Path
-
 import numpy as np
 
 from GridData import ML_OUTPUT, prepare_rows, sequence_windows
